@@ -164,6 +164,7 @@ async def get_mcp_server_tools(
                 args_schema: Type[BaseModel] = jsonschema_to_pydantic(
                     fix_schema(tool.inputSchema)  # Apply schema conversion
                 )
+                tags = ['server_name','tool.name', 'mcp']
                 session: Optional[ClientSession] = None
 
                 def _run(self, **kwargs: Any) -> NoReturn:
