@@ -152,19 +152,17 @@ McpServerCleanupFn = Callable[[], Awaitable[None]]
 
 async def convert_mcp_to_langchain_tools(
     server_configs: Dict[str, Dict[str, Any]],
+    timeout: int = 30,  # Default timeout value in seconds
     logger: logging.Logger = logging.getLogger(__name__)
 ) -> Tuple[List[BaseTool], McpServerCleanupFn]:
     """Initialize multiple MCP servers and convert their tools to
-    LangChain format.
-
-    This async function manages parallel initialization of multiple MCP
-    servers, converts their tools to LangChain format, and provides a cleanup
-    mechanism. It orchestrates the full lifecycle of multiple servers.
-
+    LangChain format with a connection timeout.
+    
     Args:
         server_configs: Dictionary mapping server names to their
             configurations, where each configuration contains command, args,
             and env settings
+        timeout: Timeout duration in seconds for server connection (default: 30s)
         logger: Logger instance to use for logging events and errors.
                Defaults to module logger.
 
@@ -173,32 +171,29 @@ async def convert_mcp_to_langchain_tools(
             - List of converted LangChain tools from all servers
             - Async cleanup function to properly shutdown all server
                 connections
-
-    Example:
-        server_configs = {
-            "server1": {"command": "npm", "args": ["start"]},
-            "server2": {"command": "./server", "args": ["-p", "8000"]}
-        }
-        tools, cleanup = await convert_mcp_to_langchain_tools(server_configs)
-        # Use tools...
-        await cleanup()
     """
+    async def spawn_with_timeout(server_name: str, server_config: Dict[str, Any], exit_stack: AsyncExitStack, timeout: int):
+        """Helper function to spawn the MCP server with a timeout"""
+        try:
+            return await asyncio.wait_for(
+                spawn_mcp_server_and_get_transport(server_name, server_config, exit_stack, logger),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout exceeded while trying to spawn MCP server '{server_name}'")
+            raise
 
     # Initialize AsyncExitStack for managing multiple server lifecycles
     stdio_transports: List[StdioTransport] = []
     async_exit_stack = AsyncExitStack()
 
-    # Spawn all MCP servers concurrently
+    # Spawn all MCP servers concurrently with timeout
     for server_name, server_config in server_configs.items():
-        # NOTE: the following `await` only blocks until the server subprocess
-        # is spawned, i.e. after returning from the `await`, the spawned
-        # subprocess starts its initialization independently of (so in
-        # parallel with) the Python execution of the following lines.
-        stdio_transport = await spawn_mcp_server_and_get_transport(
+        stdio_transport = await spawn_with_timeout(
             server_name,
             server_config,
             async_exit_stack,
-            logger
+            timeout
         )
         stdio_transports.append(stdio_transport)
 
