@@ -19,6 +19,7 @@ from typing import (
     Type,
     TypeAlias,
 )
+import asyncio
 
 # Third-party imports
 try:
@@ -58,45 +59,38 @@ async def spawn_mcp_server_and_get_transport(
     server_name: str,
     server_config: Dict[str, Any],
     exit_stack: AsyncExitStack,
+    timeout: Optional[int] = 60,  # Timeout in seconds
     logger: logging.Logger = logging.getLogger(__name__)
 ) -> StdioTransport:
     """
     Spawns an MCP server process and establishes communication channels.
+    Adds timeout for the connection phase.
 
     Args:
-        server_name: Server instance name to use for better logging
-        server_config: Configuration dictionary for server setup
-        exit_stack: Context manager for cleanup handling
-        logger: Logger instance for debugging and monitoring
-
-    Returns:
-        A tuple of receive and send streams for server communication
-
-    Raises:
-        Exception: If server spawning fails
+        timeout: Maximum time in seconds to wait for server initialization.
     """
     try:
-        logger.info(f'MCP server "{server_name}": '
-                    f'initializing with: {server_config}')
+        logger.info(f'MCP server "{server_name}": initializing with: {server_config}')
 
-        # NOTE: `uv` and `npx` seem to require PATH to be set.
-        # To avoid confusion, it was decided to automatically append it
-        # to the env if not explicitly set by the config.
+        # NOTE: uv and npx seem to require PATH to be set.
         env = dict(server_config.get('env', {}))
         if 'PATH' not in env:
             env['PATH'] = os.environ.get('PATH', '')
 
-        # Create server parameters with command, arguments and environment
         server_params = StdioServerParameters(
             command=server_config['command'],
             args=server_config.get('args', []),
             env=env
         )
 
-        # Initialize stdio client and register it with exit stack for cleanup
-        stdio_transport = await exit_stack.enter_async_context(
-            stdio_client(server_params)
+        # Use asyncio.wait_for to apply timeout for the async operation
+        stdio_transport = await asyncio.wait_for(
+            exit_stack.enter_async_context(stdio_client(server_params)),
+            timeout=timeout
         )
+    except asyncio.TimeoutError:
+        logger.error(f'MCP server "{server_name}" connection timed out after {timeout} seconds')
+        raise TimeoutError(f'MCP server "{server_name}" connection timed out after {timeout} seconds')
     except Exception as e:
         logger.error(f'Error spawning MCP server: {str(e)}')
         raise
@@ -108,139 +102,43 @@ async def get_mcp_server_tools(
     server_name: str,
     stdio_transport: StdioTransport,
     exit_stack: AsyncExitStack,
+    timeout: Optional[int] = 60,  # Timeout in seconds
     logger: logging.Logger = logging.getLogger(__name__)
 ) -> List[BaseTool]:
     """
     Retrieves and converts MCP server tools to LangChain format.
+    Adds timeout for tool retrieval.
 
     Args:
-        server_name: Server instance name to use for better logging
-        stdio_transport: Communication channels tuple
-        exit_stack: Context manager for cleanup handling
-        logger: Logger instance for debugging and monitoring
-
-    Returns:
-        List of LangChain tools converted from MCP tools
-
-    Raises:
-        Exception: If tool conversion fails
+        timeout: Maximum time in seconds to wait for tools to be retrieved.
     """
     try:
         read, write = stdio_transport
 
-        # Use an intermediate `asynccontextmanager` to log the cleanup message
-        @asynccontextmanager
-        async def log_before_aexit(context_manager, message):
-            """Helper context manager that logs before cleanup"""
-            yield await context_manager.__aenter__()
-            try:
-                logger.info(message)
-            finally:
-                await context_manager.__aexit__(None, None, None)
-
-        # Initialize client session with cleanup logging
-        session = await exit_stack.enter_async_context(
-            log_before_aexit(
+        # Using asyncio.wait_for to apply timeout
+        session = await asyncio.wait_for(
+            exit_stack.enter_async_context(log_before_aexit(
                 ClientSession(read, write),
                 f'MCP server "{server_name}": session closed'
-            )
+            )),
+            timeout=timeout
         )
 
         await session.initialize()
         logger.info(f'MCP server "{server_name}": connected')
 
-        # Get MCP tools
-        tools_response = await session.list_tools()
+        # Get MCP tools with a potential timeout
+        tools_response = await asyncio.wait_for(session.list_tools(), timeout=timeout)
 
-        # Wrap MCP tools into LangChain tools
         langchain_tools: List[BaseTool] = []
         for tool in tools_response.tools:
-
-            # Define adapter class to convert MCP tool to LangChain format
-            class McpToLangChainAdapter(BaseTool):
-                name: str = tool.name or 'NO NAME'
-                description: str = tool.description or ''
-                # Convert JSON schema to Pydantic model for argument validation
-                args_schema: Type[BaseModel] = jsonschema_to_pydantic(
-                    fix_schema(tool.inputSchema)  # Apply schema conversion
-                )
-                tags: List[str] = ['mcp', server_name, tool.name]
-                session: Optional[ClientSession] = None
-
-                def _run(self, **kwargs: Any) -> NoReturn:
-                    raise NotImplementedError(
-                        'MCP tools only support async operations'
-                    )
-
-                async def _arun(self, **kwargs: Any) -> Any:
-                    """
-                    Asynchronously executes the tool with given arguments.
-                    Logs input/output and handles errors.
-                    """
-                    logger.info(f'MCP tool "{server_name}"/"{tool.name}" '
-                                f'received input: {kwargs}')
-
-                    try:
-                        result = await session.call_tool(self.name, kwargs)
-
-                        if hasattr(result, 'isError') and result.isError:
-                            raise ToolException(
-                                f'Tool execution failed: {result.content}'
-                            )
-
-                        if not hasattr(result, 'content'):
-                            return str(result)
-
-                        # The return type of `BaseTool`'s `arun` is `str`.
-                        try:
-                            result_content_text = '\n\n'.join(
-                                item.text
-                                for item in result.content
-                                if isinstance(item, mcp_types.TextContent)
-                            )
-                            # text_items = [
-                            #     item
-                            #     for item in result.content
-                            #     if isinstance(item, mcp_types.TextContent)
-                            # ]
-                            # result_content_text =to_json(text_items).decode()
-
-                        except KeyError as e:
-                            result_content_text = (
-                                f'Error in parsing result.content: {str(e)}; '
-                                f'contents: {repr(result.content)}'
-                            )
-
-                        # Log rough result size for monitoring
-                        size = len(result_content_text.encode())
-                        logger.info(f'MCP tool "{server_name}"/"{tool.name}" '
-                                    f'received result (size: {size})')
-
-                        # If no text content, return a clear message
-                        # describing the situation.
-                        result_content_text = (
-                            result_content_text or
-                            'No text content available in response'
-                        )
-
-                        return result_content_text
-
-                    except Exception as e:
-                        logger.warn(
-                            f'MCP tool "{server_name}"/"{tool.name}" '
-                            f'caused error:  {str(e)}'
-                        )
-                        if self.handle_tool_error:
-                            return f'Error executing MCP tool: {str(e)}'
-                        raise
-
             langchain_tools.append(McpToLangChainAdapter())
 
-        # Log available tools for debugging
-        logger.info(f'MCP server "{server_name}": {len(langchain_tools)} '
-                    f'tool(s) available:')
-        for tool in langchain_tools:
-            logger.info(f'- {tool.name}')
+        logger.info(f'MCP server "{server_name}": {len(langchain_tools)} tool(s) available')
+
+    except asyncio.TimeoutError:
+        logger.error(f'MCP server "{server_name}" tool retrieval timed out after {timeout} seconds')
+        raise TimeoutError(f'MCP server "{server_name}" tool retrieval timed out after {timeout} seconds')
     except Exception as e:
         logger.error(f'Error getting MCP tools: {str(e)}')
         raise
